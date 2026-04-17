@@ -1577,7 +1577,7 @@ class ReportAgent:
         try:
             # 初始化：创建报告文件夹并保存初始状态
             ReportManager._ensure_report_folder(report_id)
-            
+
             # 初始化日志记录器（结构化日志 agent_log.jsonl）
             self.report_logger = ReportLogger(report_id)
             self.report_logger.log_start(
@@ -1585,56 +1585,133 @@ class ReportAgent:
                 graph_id=self.graph_id,
                 simulation_requirement=self.simulation_requirement
             )
-            
+
             # 初始化控制台日志记录器（console_log.txt）
             self.console_logger = ReportConsoleLogger(report_id)
-            
-            ReportManager.update_progress(
-                report_id, "pending", 0, t('progress.initReport'),
-                completed_sections=[]
-            )
-            ReportManager.save_report(report)
-            
-            # 阶段1: 规划大纲
-            report.status = ReportStatus.PLANNING
-            ReportManager.update_progress(
-                report_id, "planning", 5, t('progress.startPlanningOutline'),
-                completed_sections=[]
-            )
-            
-            # 记录规划开始日志
-            self.report_logger.log_planning_start()
-            
-            if progress_callback:
-                progress_callback("planning", 0, t('progress.startPlanningOutline'))
-            
-            outline = self.plan_outline(
-                progress_callback=lambda stage, prog, msg: 
-                    progress_callback(stage, prog // 5, msg) if progress_callback else None
-            )
-            report.outline = outline
-            
-            # 记录规划完成日志
-            self.report_logger.log_planning_complete(outline.to_dict())
-            
-            # 保存大纲到文件
-            ReportManager.save_outline(report_id, outline)
-            ReportManager.update_progress(
-                report_id, "planning", 15, t('progress.outlineDone', count=len(outline.sections)),
-                completed_sections=[]
-            )
-            ReportManager.save_report(report)
-            
-            logger.info(t('report.outlineSavedToFile', reportId=report_id))
-            
+
+            # ═══════════════════════════════════════════════════
+            # 断点续传检测：加载已有大纲和已完成的章节
+            # ═══════════════════════════════════════════════════
+            resume_mode = False
+            outline = None
+            generated_sections = []
+
+            outline_path = ReportManager._get_outline_path(report_id)
+            if os.path.exists(outline_path):
+                try:
+                    with open(outline_path, 'r', encoding='utf-8') as f:
+                        outline_data = json.load(f)
+                    outline = ReportOutline(
+                        title=outline_data['title'],
+                        summary=outline_data['summary'],
+                        sections=[
+                            ReportSection(title=s['title'], content=s.get('content', ''))
+                            for s in outline_data.get('sections', [])
+                        ]
+                    )
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"加载已有大纲失败，将重新规划: {e}")
+                    outline = None
+
+            if outline:
+                existing_sections = ReportManager.get_generated_sections(report_id)
+                generated_indices = set()
+                for sec_info in existing_sections:
+                    idx = sec_info['section_index']
+                    if 1 <= idx <= len(outline.sections):
+                        content = sec_info['content']
+                        outline.sections[idx - 1].content = content
+                        generated_sections.append(content)
+                        completed_section_titles.append(outline.sections[idx - 1].title)
+                        generated_indices.add(idx)
+
+                # 大纲存在即进入续传模式（即使 0 个章节已完成也跳过规划）
+                resume_mode = True
+                if completed_section_titles:
+                    logger.info(
+                        f"断点续传: 已完成 {len(completed_section_titles)}/{len(outline.sections)} 章节 "
+                        f"({', '.join(completed_section_titles)})"
+                    )
+                else:
+                    logger.info("断点续传: 大纲已存在，从章节生成阶段开始")
+                    self.report_logger.log(
+                        action="resume_detected",
+                        stage="pending",
+                        details={
+                            "completed_count": len(completed_section_titles),
+                            "total_count": len(outline.sections),
+                            "completed_sections": completed_section_titles,
+                            "message": f"检测到已有 {len(completed_section_titles)} 个章节，将续传生成"
+                        }
+                    )
+
+            if resume_mode:
+                # 续传模式：跳过规划，直接进入章节生成
+                report.outline = outline
+                report.status = ReportStatus.GENERATING
+                ReportManager.update_progress(
+                    report_id, "generating",
+                    20 + int((len(completed_section_titles) / len(outline.sections)) * 70),
+                    f"断点续传: 已完成 {len(completed_section_titles)}/{len(outline.sections)} 章节，继续生成",
+                    completed_sections=completed_section_titles
+                )
+                ReportManager.save_report(report)
+            else:
+                # 全新生成模式
+                ReportManager.update_progress(
+                    report_id, "pending", 0, t('progress.initReport'),
+                    completed_sections=[]
+                )
+                ReportManager.save_report(report)
+
+                # 阶段1: 规划大纲
+                report.status = ReportStatus.PLANNING
+                ReportManager.update_progress(
+                    report_id, "planning", 5, t('progress.startPlanningOutline'),
+                    completed_sections=[]
+                )
+
+                # 记录规划开始日志
+                self.report_logger.log_planning_start()
+
+                if progress_callback:
+                    progress_callback("planning", 0, t('progress.startPlanningOutline'))
+
+                outline = self.plan_outline(
+                    progress_callback=lambda stage, prog, msg:
+                        progress_callback(stage, prog // 5, msg) if progress_callback else None
+                )
+                report.outline = outline
+
+                # 记录规划完成日志
+                self.report_logger.log_planning_complete(outline.to_dict())
+
+                # 保存大纲到文件
+                ReportManager.save_outline(report_id, outline)
+                ReportManager.update_progress(
+                    report_id, "planning", 15, t('progress.outlineDone', count=len(outline.sections)),
+                    completed_sections=[]
+                )
+                ReportManager.save_report(report)
+
+                logger.info(t('report.outlineSavedToFile', reportId=report_id))
+
             # 阶段2: 逐章节生成（分章节保存）
             report.status = ReportStatus.GENERATING
-            
+
             total_sections = len(outline.sections)
-            generated_sections = []  # 保存内容用于上下文
-            
+            # 续传模式 generated_sections 已填充，全新模式为空列表
+            if not resume_mode:
+                generated_sections = []
+
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
+
+                # 断点续传：跳过已完成的章节
+                if resume_mode and section.content:
+                    logger.info(f"跳过已完成章节: {section.title}")
+                    continue
+
                 base_progress = 20 + int((i / total_sections) * 70)
                 
                 # 更新进度

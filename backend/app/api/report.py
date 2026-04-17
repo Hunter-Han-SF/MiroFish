@@ -70,19 +70,32 @@ def generate_report():
             }), 404
 
         # 检查是否已有报告
-        if not force_regenerate:
-            existing_report = ReportManager.get_report_by_simulation(simulation_id)
-            if existing_report and existing_report.status == ReportStatus.COMPLETED:
-                return jsonify({
-                    "success": True,
-                    "data": {
-                        "simulation_id": simulation_id,
-                        "report_id": existing_report.report_id,
-                        "status": "completed",
-                        "message": t('api.reportAlreadyExists'),
-                        "already_generated": True
-                    }
-                })
+        existing_report = ReportManager.get_report_by_simulation(simulation_id)
+        if existing_report and existing_report.status == ReportStatus.COMPLETED and not force_regenerate:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "simulation_id": simulation_id,
+                    "report_id": existing_report.report_id,
+                    "status": "completed",
+                    "message": t('api.reportAlreadyExists'),
+                    "already_generated": True
+                }
+            })
+
+        # 正在生成中的报告不允许重复提交
+        if existing_report and existing_report.status in (ReportStatus.PLANNING, ReportStatus.GENERATING, ReportStatus.PENDING):
+            return jsonify({
+                "success": False,
+                "error": "报告正在生成中，请稍后查询进度",
+                "report_id": existing_report.report_id
+            }), 409
+
+        # 断点续传：如果已有 failed 的报告，复用其 report_id
+        report_id = data.get('report_id')
+        if not report_id and existing_report and existing_report.status == ReportStatus.FAILED:
+            report_id = existing_report.report_id
+            logger.info(f"检测到失败报告 {report_id}，将断点续传")
         
         # 获取项目信息
         project = ProjectManager.get_project(state.project_id)
@@ -105,10 +118,11 @@ def generate_report():
                 "success": False,
                 "error": t('api.missingSimRequirement')
             }), 400
-        
-        # 提前生成 report_id，以便立即返回给前端
+
+        # 生成 report_id（如果未通过续传获得）
         import uuid
-        report_id = f"report_{uuid.uuid4().hex[:12]}"
+        if not report_id:
+            report_id = f"report_{uuid.uuid4().hex[:12]}"
         
         # 创建异步任务
         task_manager = TaskManager()
@@ -187,7 +201,8 @@ def generate_report():
                 "task_id": task_id,
                 "status": "generating",
                 "message": t('api.reportGenerateStarted'),
-                "already_generated": False
+                "already_generated": False,
+                "resumed": existing_report is not None and existing_report.status == ReportStatus.FAILED
             }
         })
         

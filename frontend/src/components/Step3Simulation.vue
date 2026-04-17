@@ -322,6 +322,8 @@ const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
+const reportRetryCount = ref(0) // 报告生成重试次数
+const MAX_REPORT_RETRIES = 3 // 最大重试次数
 const allActions = ref([]) // 所有动作（增量累积）
 const actionIds = ref(new Set()) // 用于去重的动作ID集合
 const scrollContainer = ref(null)
@@ -651,30 +653,49 @@ const handleNextStep = async () => {
     addLog(t('log.reportRequestSent'))
     return
   }
-  
+
   isGeneratingReport.value = true
   addLog(t('log.startingReportGen'))
-  
-  try {
-    const res = await generateReport({
-      simulation_id: props.simulationId,
-      force_regenerate: true
-    })
-    
-    if (res.success && res.data) {
-      const reportId = res.data.report_id
-      addLog(t('log.reportGenTaskStarted', { reportId }))
-      
-      // 跳转到报告页面
-      router.push({ name: 'Report', params: { reportId } })
-    } else {
-      addLog(t('log.reportGenFailed', { error: res.error || t('common.unknownError') }))
-      isGeneratingReport.value = false
+
+  const tryGenerateReport = async () => {
+    try {
+      const res = await generateReport({
+        simulation_id: props.simulationId,
+        force_regenerate: true
+      })
+
+      if (res.success && res.data) {
+        const reportId = res.data.report_id
+        reportRetryCount.value = 0
+        addLog(t('log.reportGenTaskStarted', { reportId }))
+
+        router.push({ name: 'Report', params: { reportId } })
+      } else {
+        throw new Error(res.error || t('common.unknownError'))
+      }
+    } catch (err) {
+      const error = err.message || t('common.unknownError')
+
+      const isOverloadError = error.includes('529') || error.includes('overload') ||
+                            error.includes('429') || error.includes('rate limit') ||
+                            error.includes('ECONNREFUSED') || error.includes('ETIMEDOUT')
+
+      if (isOverloadError && reportRetryCount.value < MAX_REPORT_RETRIES) {
+        reportRetryCount.value++
+        const waitTime = 5000 * reportRetryCount.value
+        addLog(`报告生成繁忙，${waitTime / 1000}s 后自动重试 (${reportRetryCount.value}/${MAX_REPORT_RETRIES})...`)
+
+        await new Promise(resolve => setTimeout(resolve, waitTime))
+        return tryGenerateReport()
+      } else {
+        addLog(t('log.reportGenFailed', { error }))
+        isGeneratingReport.value = false
+        reportRetryCount.value = 0
+      }
     }
-  } catch (err) {
-    addLog(t('log.reportGenException', { error: err.message }))
-    isGeneratingReport.value = false
   }
+
+  await tryGenerateReport()
 }
 
 // Scroll log to bottom
